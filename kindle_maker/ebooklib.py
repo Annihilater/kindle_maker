@@ -11,18 +11,77 @@ import io
 import sys
 import warnings
 import re
+import logging
+import zipfile
 from typing import Optional, List
 
 from jinja2 import Environment, FileSystemLoader
+import requests
+from PIL import Image
 
 from kindle_maker.kindlegen import kindlegen
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
 
 
 def format_file_name(path: str) -> str:
     """
     remove illegal characters
     """
-    return re.sub(r'[/\\?%*:|"\'<>.,;=\s+]+', '', path)
+    return re.sub(r'[/\\?%*:|"\'<>.,;=\s+&#]+', '', path)
+
+
+def _save_img(content: bytes,
+              filename: pathlib.Path,
+              min_width: int = None,
+              min_height: int = None,
+              ratio: float = None) -> None:
+    min_width = min_width or 500
+    min_height = min_height or 500
+    ratio = ratio or 1.0
+    img = Image.open(io.BytesIO(content))
+    w, h = img.size
+    if w <= min_width or h <= min_height:
+        img.save(filename, img.format)
+        return
+
+    rw, rh = int(w * ratio), int(h * ratio)
+    if rw < min_width:
+        rw, rh = min_width, int(rh * min_width / rw)
+    if rh < min_height:
+        rw, rh = int(rw * min_height / rh), min_height
+    img.thumbnail((rw, rh))
+    img.save(filename, img.format)
+
+
+def download_image(content: str,
+                   dest_dir: pathlib.Path,
+                   **kwargs) -> str:
+    """
+    下载 content(html text) 中的 image
+    """
+
+    p = r'img.+src="(.*?)"'
+    img_url_list = re.findall(p, content)
+    for url in img_url_list:
+        url_local = format_file_name(url)
+        # append a default img format
+        if '.' not in url_local:
+            url_local += '.png'
+        r = requests.get(url, timeout=20)
+        img_fn = dest_dir / url_local
+        _save_img(
+            r.content, img_fn,
+            min_width=kwargs.get('image_min_width'),
+            min_height=kwargs.get('image_min_height'),
+            ratio=kwargs.get('image_ratio')
+        )
+        logger.info(f"download image {url}")
+        content = content.replace(url, './{}'.format(url_local))
+    return content
 
 
 class EbookUtil:
@@ -146,7 +205,13 @@ class EbookUtil:
         create a epub ebook
         """
         self._generate_all_files()
-        raise NotImplementedError
+        zipf = zipfile.ZipFile(self._ebook.dest_file_path, 'w',
+                               zipfile.ZIP_DEFLATED)
+        for root, dirs, files in os.walk(str(self._ebook.tmpdir)):
+            for file in files:
+                zipf.write(os.path.join(root, file))
+                logger.info(f'zip file {file}')
+        zipf.close()
 
     def create(self):
         getattr(self, '_create_{}'.format(self._ebook.format))()
@@ -155,13 +220,10 @@ class EbookUtil:
 class Chapter:
     max_level = 2
 
-    def __init__(self, title: str, ebook: 'Ebook',
-                 file_path: str = None, level: int = 1):
+    def __init__(self, title: str, ebook: 'Ebook', level: int = 1):
         self.title = title
         self._ebook = ebook
-        if file_path and not pathlib.Path(file_path).is_file():
-            raise ValueError('{} is not a file'.format(file_path))
-        self._file_path = file_path
+
         self._level = level
         self._content = Optional[None]
         self._static_files = list()
@@ -177,9 +239,6 @@ class Chapter:
 
     @property
     def content(self) -> str:
-        if self._file_path:
-            with io.open(self._file_path, encoding='utf-8') as f:
-                return f.read()
         return self._content
 
     @property
@@ -188,7 +247,6 @@ class Chapter:
 
     def set_content(self, content: str) -> 'Chapter':
         self._content = content
-        self._file_path = None
         return self
 
     def add_static_files(self, *file_path) -> 'Chapter':
@@ -209,6 +267,8 @@ class Chapter:
         return ct
 
     def save(self):
+        if self._ebook.auto_download_img:
+            self._content = download_image(self.content, self._ebook.tmpdir)
         dest_file_path = self.full_dest_file_path
         with dest_file_path.open(mode='w', encoding='utf-8') as f:
             f.write(self.content)
@@ -218,10 +278,16 @@ class Chapter:
 
 class Ebook:
 
-    def __init__(self, title: str, author=None, ebook_format: str = 'mobi'):
+    def __init__(self,
+                 title: str,
+                 author=None,
+                 ebook_format: str = 'mobi',
+                 auto_download_img: bool = False):
+
         self.title: str = title
         self.author: str = author
         self.format = ebook_format
+        self.auto_download_img = auto_download_img
         self.cover_path: str = None
         self.cover_content: bytes = None
         self._tempdir = pathlib.Path(tempfile.gettempdir()) / str(time.time())
@@ -260,19 +326,18 @@ class Ebook:
         self.chapter_list.append(chapter)
         return self
 
-    def create_chapter(self, chapter_title: str,
-                       chapter_file_path: str = None) -> Chapter:
+    def create_chapter(self, chapter_title: str) -> Chapter:
         """
         create a chapter
         """
-        ct = Chapter(chapter_title, self, chapter_file_path)
+        ct = Chapter(chapter_title, self)
         self.add_chapter(ct)
         return ct
 
     def _create(self):
         if not self.chapter_list:
             raise ValueError('chapter list is empty')
-        return self._eu.create_epub()
+        return self._eu.create()
 
     def save(self, file_path: str = None):
         """
@@ -280,7 +345,13 @@ class Ebook:
         """
         self._create()
         file_path = file_path or self.dest_file_path
-        shutil.copy(str(self.full_dest_file_path), file_path)
+        if self.format == 'mobi':
+            src_file_path = self.full_dest_file_path
+        else:
+            src_file_path = self.dest_file_path
+        if file_path == src_file_path:
+            return
+        shutil.copy(str(src_file_path), file_path)
 
     def show(self) -> int:
         """
@@ -307,6 +378,8 @@ class Ebook:
                     p.unlink()
             root.rmdir()
         rmtree(self.tmpdir)
+
+        logger.info(f"deleted temp files")
 
 
 ################################################################################
